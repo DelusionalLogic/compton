@@ -128,6 +128,8 @@
 #include "framebuffer.h"
 #include "xorg.h"
 #include "text.h"
+#include "components/focus.h"
+#include "vector.h"
 
 // @CLEANUP @HACK We don't actually want this here, but because everything is in
 // here i do now.
@@ -1096,6 +1098,9 @@ typedef struct _session_t {
   /// Linked list of additional atoms to track.
   latom_t *track_atom_lst;
 
+  Vector keys;
+  Vector focusData;
+
 #ifdef CONFIG_DBUS
   // === DBus related ===
   // DBus connection.
@@ -1110,6 +1115,7 @@ extern const char* const StateNames[];
 enum WindowState {
     STATE_HIDING,
     STATE_INVISIBLE,
+    STATE_MAPPING, // Special for windows that are awating activation
     STATE_ACTIVATING,
     STATE_ACTIVE,
     STATE_DEACTIVATING,
@@ -1134,6 +1140,12 @@ typedef struct _win {
   XWindowAttributes a;
 
   enum WindowState state;
+
+  // A value >1 means we want to map, <1 means we want to unmap. 0 means do
+  // nothing
+  int map_request;
+  /// Whether the window has been destroyed.
+  bool destroyed;
 
 #ifdef CONFIG_XINERAMA
   /// Xinerama screen this window is on.
@@ -1167,8 +1179,6 @@ typedef struct _win {
   XserverRegion reg_ignore;
   /// Cached width/height of the window including border.
   int widthb, heightb;
-  /// Whether the window has been destroyed.
-  bool destroyed;
   /// Whether the window is bounding-shaped.
   bool bounding_shaped;
   /// Whether this window is to be painted.
@@ -1203,6 +1213,7 @@ typedef struct _win {
   // Focus-related members
   /// Whether the window is to be considered focused.
   bool focused;
+  bool focused_changed;
   /// Override value of window focus state. Set by D-Bus method calls.
   switch_t focused_force;
 

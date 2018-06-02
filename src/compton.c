@@ -10,6 +10,7 @@
 
 #include "compton.h"
 #include <ctype.h>
+#include <execinfo.h>
 
 #include "opengl.h"
 #include "vmath.h"
@@ -79,6 +80,7 @@ const char * const BACKEND_STRS[NUM_BKEND + 1] = {
 const char* const StateNames[] = {
     "Hiding",
     "Invisible",
+    "Mapping",
     "Activating",
     "Active",
     "Deactivating",
@@ -650,7 +652,7 @@ paint_preprocess(session_t *ps, win *list) {
             }
 
             // If the window doesn't want to be redirected, then who are we to argue
-            if(w->state != STATE_DESTROYED && w->state != STATE_DESTROYING) {
+            if(w->state != STATE_DESTROYED && w->state != STATE_DESTROYING && false) {
                 winprop_t prop = wid_get_prop(ps, w->id, ps->atom_bypass, 1L, XA_CARDINAL, 32);
                 // A value of 1 means that the window has taken special care to ask
                 // us not to do compositing.It would be great if we could just
@@ -884,19 +886,8 @@ map_win(session_t *ps, Window id) {
   printf_dbgf("(%#010lx): type %s\n", w->id, WINTYPES[w->window_type]);
 #endif
 
-  // @HACK: We need to save the old state here before recheck focus might
-  // change it. It kinda sucks, but such is life.
-  enum WindowState oldstate = w->state;
-
-  // FocusIn/Out may be ignored when the window is unmapped, so we must
-  // recheck focus here
-  if (ps->o.track_focus)
-    recheck_focus(ps);
-
-  // Update window focus state
-  win_update_focused(ps, w);
-
   w->flags |= WFLAG_OPCT_CHANGE;
+  w->map_request++;
 
   // Many things above could affect shadow
   win_determine_shadow(ps, w);
@@ -908,7 +899,7 @@ map_win(session_t *ps, Window id) {
   if(ps->redirected) {
       // If the window was invisible we need to bind it again, since it was
       // unbound.
-      if(oldstate == STATE_INVISIBLE) {
+      if(w->state == STATE_INVISIBLE) {
           // configure_win might rebind, so we need to bind before
           if(!wd_bind(&w->drawable)) {
               printf_errf("Failed binding window drawable %s", w->name);
@@ -919,7 +910,7 @@ map_win(session_t *ps, Window id) {
               printf_errf("Failed resizing window blur %s", w->name);
               return;
           }
-      } else if(oldstate == STATE_HIDING){
+      } else if(w->state == STATE_HIDING){
           // If we were in the process of unmapping before we need to rebind
           if(!wd_unbind(&w->drawable)) {
               printf_errf("Failed unbinding window on resize");
@@ -933,23 +924,7 @@ map_win(session_t *ps, Window id) {
   // Set fading state
   w->in_openclose = true;
 
-  // recheck focus will set the state of the actually focused window, but
-  // apparently multiple windows can be focused.
-  // @HACK: For now we just let all other focused windows be active as well,
-  // but we really should distinguish between being active and focused.
-  if(w->focused) {
-      if(w->state == STATE_INVISIBLE || w->state == STATE_HIDING) {
-          w->state = STATE_ACTIVATING;
-          win_start_opacity(w, ps->o.active_opacity, ps->o.opacity_fade_time);
-      }
-  } else {
-      // If we aren't focused, then no one have set out state.
-      assert(w->state == STATE_INVISIBLE || w->state == STATE_HIDING);
-      w->state = STATE_DEACTIVATING;
-      win_start_opacity(w, ps->o.inactive_opacity, ps->o.opacity_fade_time);
-  }
-
-  assert(w->state == STATE_ACTIVATING || w->state == STATE_DEACTIVATING);
+  assert(w->state == STATE_INVISIBLE || w->state == STATE_HIDING);
 
   /* if any configure events happened while
      the window was unmapped, then configure
@@ -1002,11 +977,7 @@ static void unmap_win(session_t *ps, win *w) {
   w->a.map_state = IsUnmapped;
 
   // Fading out
-  w->state = STATE_HIDING;
-  w->flags |= WFLAG_OPCT_CHANGE;
-
-  win_start_opacity(w, 0, ps->o.opacity_fade_time);
-
+  w->map_request--;
   w->in_openclose = true;
 
   // don't care about properties anymore
@@ -1063,7 +1034,7 @@ win_determine_mode(session_t *ps, win *w) {
 static double calc_opacity(session_t *ps, win *w) {
     double opacity = 100.0;
 
-    if (w->destroyed || IsViewable != w->a.map_state) {
+    if (IsViewable != w->a.map_state) {
         opacity = 0.0;
     } else {
         // Try obeying window type opacity firstly
@@ -1100,7 +1071,7 @@ calc_dim(session_t *ps, win *w) {
   bool dim;
 
   // Make sure we do nothing if the window is unmapped / destroyed
-  if (w->destroyed || IsViewable != w->a.map_state)
+  if (IsViewable != w->a.map_state)
     return;
 
   if (ps->o.inactive_dim && !(w->focused)) {
@@ -1126,7 +1097,7 @@ win_determine_fade(session_t *ps, win *w) {
     w->fade_last = w->fade = w->fade_force;
   else if (ps->o.no_fading_openclose && w->in_openclose)
     w->fade_last = w->fade = false;
-  else if (ps->o.no_fading_destroyed_argb && w->destroyed
+  else if (ps->o.no_fading_destroyed_argb
       && WMODE_ARGB == w->mode && w->client_win && w->client_win != w->id) {
     w->fade_last = w->fade = false;
   }
@@ -1232,7 +1203,6 @@ static void
 win_on_wtype_change(session_t *ps, win *w) {
   win_determine_shadow(ps, w);
   win_determine_fade(ps, w);
-  win_update_focused(ps, w);
   if (ps->o.invert_color_list)
     win_determine_invert_color(ps, w);
   if (ps->o.opacity_rules)
@@ -1250,8 +1220,6 @@ win_on_factor_change(session_t *ps, win *w) {
     win_determine_fade(ps, w);
   if (ps->o.invert_color_list)
     win_determine_invert_color(ps, w);
-  if (ps->o.focus_blacklist)
-    win_update_focused(ps, w);
   if (ps->o.blur_background_blacklist)
     win_determine_blur_background(ps, w);
   if (ps->o.opacity_rules)
@@ -1340,9 +1308,6 @@ win_mark_client(session_t *ps, win *w, Window client) {
 
   // Update everything related to conditions
   win_on_factor_change(ps, w);
-
-  // Update window focus state
-  win_update_focused(ps, w);
 }
 
 /**
@@ -1816,11 +1781,12 @@ destroy_win(session_t *ps, Window id) {
 
   if (w) {
     w->destroyed = true;
-
     // You can only destroy a window that is already hiding or invisible
-    assert(w->state == STATE_HIDING || w->state == STATE_INVISIBLE);
-
-    w->state = STATE_DESTROYING;
+    assert(
+        w->state == STATE_HIDING
+        || w->state == STATE_INVISIBLE
+        || w->map_request < 0
+    );
 
 #ifdef CONFIG_DBUS
     // Send D-Bus signal
@@ -2029,17 +1995,16 @@ static void win_update_focused(session_t *ps, win *w) {
         w->focused = true;
     }
 
+    if(ps->active_win == w) {
+        w->focused = true;
+    }
+
     // If window grouping detection is enabled, mark the window active if its
     // group is
     if (ps->o.track_leader && ps->active_leader
             && win_get_leader(ps, w) == ps->active_leader) {
         w->focused = true;
     }
-
-    // Always recalculate the window target opacity, since some opacity-related
-    // options depend on the output value of win_is_focused_real() instead of
-    // w->focused
-    w->flags |= WFLAG_OPCT_CHANGE;
 }
 
 /**
@@ -2062,41 +2027,18 @@ static void win_set_focused(session_t *ps, win *w, bool focused) {
             Window leader = win_get_leader(ps, old_active);
             if (!win_is_focused_real(ps, w) && leader && leader == ps->active_leader && !group_is_focused(ps, leader)) {
                 ps->active_leader = None;
-
-                //Update the focused state of all other windows lead by leader
-                for (win *t = ps->list; t; t = t->next) {
-                    if (win_get_leader(ps, t) == leader)
-                        win_update_focused(ps, t);
-                }
             }
-
-            win_update_focused(ps, old_active);
-
-            double opacity = calc_opacity(ps, old_active);
-            old_active->state = STATE_DEACTIVATING;
-            win_start_opacity(old_active, opacity, ps->o.opacity_fade_time);
-            /* win_set_focused(ps, ps->active_win, false); */
-
         }
 
         ps->active_win = w;
 
-        w->state = STATE_ACTIVATING;
-        win_start_opacity(w, ps->o.active_opacity, ps->o.opacity_fade_time);
-
     } else if (w == ps->active_win) {
         ps->active_win = NULL;
-
-        double opacity = calc_opacity(ps, w);
-        w->state = STATE_DEACTIVATING;
-        win_start_opacity(w, opacity, ps->o.opacity_fade_time);
     } else {
         assert(false);
     }
 
     assert(win_is_focused_real(ps, w) == focused);
-
-    win_update_focused(ps, w);
 
     // If window grouping detection is enabled
     if (ps->o.track_leader) {
@@ -2104,30 +2046,10 @@ static void win_set_focused(session_t *ps, win *w, bool focused) {
 
         // If the window gets focused, replace the old active_leader
         if (win_is_focused_real(ps, w) && leader != ps->active_leader) {
-            Window active_leader_old = ps->active_leader;
-
             ps->active_leader = leader;
-
-            //Update the focused state of all other windows lead by old leader
-            for (win *t = ps->list; t; t = t->next) {
-                if (win_get_leader(ps, t) == active_leader_old)
-                    win_update_focused(ps, t);
-            }
-
-            //Update the focused state of all other windows lead by leader
-            for (win *t = ps->list; t; t = t->next) {
-                if (win_get_leader(ps, t) == leader)
-                    win_update_focused(ps, t);
-            }
         } else if (!win_is_focused_real(ps, w) && leader && leader == ps->active_leader
                 && !group_is_focused(ps, leader)) {
             ps->active_leader = None;
-
-            //Update the focused state of all other windows lead by leader
-            for (win *t = ps->list; t; t = t->next) {
-                if (win_get_leader(ps, t) == leader)
-                    win_update_focused(ps, t);
-            }
         }
     }
 
@@ -5697,7 +5619,7 @@ session_destroy(session_t *ps) {
       // Must be put here to avoid segfault
       next = w->next;
 
-      if (IsViewable == w->a.map_state && !w->destroyed)
+      if (IsViewable == w->a.map_state)
         win_ev_stop(ps, w);
 
       wd_delete(&w->drawable);
@@ -5913,6 +5835,62 @@ session_run(session_t *ps) {
         ps->tmout_unredir_hit = false;
 
         zone_leave(&ZONE_preprocess);
+
+        for (win *w = ps->list; w != NULL; w = w->next) {
+            if(w->map_request == 0)
+                continue;
+
+            if(w->map_request > 0) {
+                w->state = STATE_MAPPING;
+            } else {
+                w->state = STATE_HIDING;
+                win_start_opacity(w, 0, ps->o.opacity_fade_time);
+            }
+            w->map_request = 0;
+
+            if(w->destroyed) {
+                w->state = STATE_DESTROYING;
+            }
+        }
+
+        for (win *w = ps->list; w != NULL; w = w->next) {
+            if(w->state == STATE_DESTROYING || w->state == STATE_DESTROYED)
+                continue;
+
+            bool oldFocus = w->focused;
+            if (ps->o.track_focus)
+                recheck_focus(ps);
+
+            win_update_focused(ps, w);
+            w->focused_changed = w->focused != oldFocus;
+        }
+
+        for (win *w = ps->list; w != NULL; w = w->next) {
+            if(!w->focused_changed && w->state != STATE_MAPPING)
+                continue;
+
+            if(w->state == STATE_INVISIBLE || w->state == STATE_HIDING ||
+                    w->state == STATE_DESTROYING || w->state == STATE_DESTROYED)
+                continue;
+
+            if(w->focused) {
+                assert(
+                    w->state == STATE_DEACTIVATING
+                    || w->state == STATE_INACTIVE
+                    || w->state == STATE_MAPPING
+                );
+                w->state = STATE_ACTIVATING;
+                win_start_opacity(w, ps->o.active_opacity, ps->o.opacity_fade_time);
+            } else {
+                assert(
+                    w->state == STATE_ACTIVATING
+                    || w->state == STATE_ACTIVE
+                    || w->state == STATE_MAPPING
+                );
+                w->state = STATE_DEACTIVATING;
+                win_start_opacity(w, ps->o.inactive_opacity, ps->o.opacity_fade_time);
+            }
+        }
 
         zone_enter(&ZONE_update);
 
