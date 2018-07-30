@@ -18,6 +18,6 @@ void main() {
 
     gl_FragColor *= opacity;
 
-    if(gl_FragColor.a == 0)
-        discard;
+    /* if(gl_FragColor.a == 0) */
+        /* discard; */
 }
