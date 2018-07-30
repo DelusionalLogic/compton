@@ -1,6 +1,7 @@
 #include "zone.h"
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <assert.h>
 
 struct ZoneEventStream stream;
